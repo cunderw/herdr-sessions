@@ -1,5 +1,5 @@
 {
   "global": { "ctrl-b h": "mod.open:sessions" },
   "terminal": { "ctrl-b h": "mod.open:sessions" },
-  "mod:sessions": { "ctrl-j": "sessions.next", "ctrl-k": "sessions.prev" }
+  "mod:sessions": { "ctrl-j": "sessions.next", "ctrl-k": "sessions.prev", "ctrl-o": "sessions.fork", "ctrl-s": "sessions.send" }
 }

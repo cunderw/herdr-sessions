@@ -86,8 +86,24 @@ export function cleanPrompt(text) {
   const tag = s.match(/^<([a-z_-]+)[\s>]/)?.[1];
   if (tag && tag !== "pasted_content") return null;
   if (SKIP.some((p) => s.startsWith(p))) return null;
+  const raw = s;
   s = s.replace(/<\/?pasted_content[^>]*>/g, " ").replace(/^(\[Image[^\]]*\]\s*)+/, "").trim();
-  return s ? { text: s, command: false } : null;
+  return s ? { text: s, raw, command: false } : null;
+}
+
+// A headline for a session with no title of its own: the first sentence of the first prompt,
+// from its first line with words, leaving out code blocks, Markdown markers and pasted text
+// when there's something else to go on. Slash commands stay as typed (`/review 42`).
+export function shortTitle(text) {
+  let s = String(text);
+  const own = s.replace(/<pasted_content[^>]*>[\s\S]*?(<\/pasted_content>|$)/g, " ");
+  if (own.trim()) s = own;
+  s = s.replace(/<\/?pasted_content[^>]*>/g, " ").replace(/```[\s\S]*?(```|$)/g, " ");
+  const line = s.split("\n").map((l) => l.replace(/^\s*(#+|[-*>]|\d+[.)])\s+/, "").trim()).find(Boolean) ?? "";
+  let t = line.match(/^.*?[.?!](?=\s|$)/)?.[0] ?? line;
+  if (t.length < 16) t = line; // "Hi." or "Ok." says little; keep the line
+  t = t.replace(/\s+/g, " ").trim();
+  return t.length > 80 ? `${t.slice(0, 80).replace(/\s+\S*$/, "")}…` : t;
 }
 
 // rg when it's installed, grep -E otherwise, with the same patterns. Output lines are
@@ -137,7 +153,9 @@ async function indexClaude(files) {
       // The first record that knows the folder and branch.
       grepFiles([String.raw`"cwd":"[^"]*"`, String.raw`"gitBranch":"[^"]*"`], part, { max: 1 }),
       // Typed prompts (string content) and titles; tool results are arrays and don't match.
-      grepFiles([String.raw`"role":"user","content":"${CH}{0,240}`, String.raw`"(aiTitle|customTitle)":"${CH}*"`], part),
+      // Title records start their line. `summary` is what older Claude Code versions wrote;
+      // anchoring keeps tool inputs with a "summary" key (SendMessage, tasks) out.
+      grepFiles([String.raw`"role":"user","content":"${CH}{0,240}`, String.raw`^\{"type":"(ai-title|custom-title|summary)","(aiTitle|customTitle|summary)":"${CH}*"`], part),
     ]);
     for (const [path, m] of where) {
       const s = found[path];
@@ -147,12 +165,12 @@ async function indexClaude(files) {
     }
     for (const [path, m] of said) {
       const s = found[path];
-      if (m.startsWith('"role"')) s.prompts.push(m.slice('"role":"user","content":"'.length));
-      else if (m.startsWith('"aiTitle"')) s.ai = unescape(m.slice(11, -1));
-      else if (m.startsWith('"customTitle"')) s.custom = unescape(m.slice(15, -1));
+      if (m.startsWith('"role"')) { s.prompts.push(m.slice('"role":"user","content":"'.length)); continue; }
+      const t = m.match(/^\{"type":"[a-z-]+","(aiTitle|customTitle|summary)":"(.*)"$/);
+      if (t) s[{ aiTitle: "ai", customTitle: "custom", summary: "summary" }[t[1]]] = unescape(t[2]);
     }
   }
-  return Object.values(found).map((s) => finish(s, s.ai || chosenTitle(s.custom, s.cwd)));
+  return Object.values(found).map((s) => finish(s, s.ai || chosenTitle(s.custom, s.cwd) || s.summary));
 }
 
 async function indexCodex(files, h) {
@@ -189,6 +207,7 @@ function finish(s, title, hidden = false) {
   const first = kept.find((p) => !p.command) ?? kept[0];
   const prompt = first ? first.text.replace(/\s+/g, " ").trim() : "";
   return {
+    short: first ? (first.command ? first.text : shortTitle(first.raw.replace(/^(\[Image[^\]]*\]\s*)+/, ""))) : "",
     agent: s.agent, id: s.id, path: s.path, mtime: s.mtime, size: s.size,
     cwd: s.cwd ?? null, branch: s.branch && s.branch !== "HEAD" ? s.branch : null,
     title: title ? title.replace(/\s+/g, " ").trim() : null, prompt, turns: kept.length,
@@ -198,7 +217,7 @@ function finish(s, title, hidden = false) {
 
 // ---- The cached list ------------------------------------------------------------------
 
-const CACHE_VERSION = 1;
+const CACHE_VERSION = 2;
 const cachePath = () => `${appHome()}/data/sessions/index.json`;
 
 export async function cached() {
@@ -290,6 +309,9 @@ export async function preview(s) {
   };
   const said = (blocks, types) => (Array.isArray(blocks) ? blocks : [])
     .filter((b) => types.includes(b?.type)).map((b) => b.text).join("\n");
+  // Replies to what a tool or another session injected as a "user" message are left out
+  // with it, so an exchange is always your prompt and the answer to it.
+  let skipping = false;
   for (const line of lines) {
     if (!line.startsWith("{")) continue;
     let j;
@@ -298,13 +320,16 @@ export async function preview(s) {
       const m = j.message;
       if (!m || j.isSidechain || j.isMeta) continue;
       if (j.type === "user") {
-        const p = cleanPrompt(typeof m.content === "string" ? m.content : said(m.content, ["text"]));
+        const text = typeof m.content === "string" ? m.content : said(m.content, ["text"]);
+        if (!text) continue; // a tool result
+        const p = cleanPrompt(text);
+        skipping = !p;
         if (p) add("you", p.text);
-      } else if (j.type === "assistant") add("agent", said(m.content, ["text"]));
+      } else if (j.type === "assistant" && !skipping) add("agent", said(m.content, ["text"]));
     } else if (j.type === "response_item" && j.payload?.type === "message") {
       const p = j.payload;
-      if (p.role === "user") { const c = cleanPrompt(said(p.content, ["input_text"])); if (c) add("you", c.text); }
-      else if (p.role === "assistant") add("agent", said(p.content, ["output_text"]));
+      if (p.role === "user") { const c = cleanPrompt(said(p.content, ["input_text"])); skipping = !c; if (c) add("you", c.text); }
+      else if (p.role === "assistant" && !skipping) add("agent", said(p.content, ["output_text"]));
     }
   }
   // A long first turn can push the prompt out of the tail; the index still has it.
@@ -358,11 +383,14 @@ export async function live() {
 
 // ---- Bringing one back ----------------------------------------------------------------------
 
-export const command = (s) => (s.agent === "claude" ? ["claude", "--resume", s.id] : ["codex", "resume", s.id]);
+// fork: a new session that starts from this one's history; the original is left as it was.
+export const command = (s, fork = false) => s.agent === "claude"
+  ? ["claude", "--resume", s.id, ...(fork ? ["--fork-session"] : [])]
+  : ["codex", fork ? "fork" : "resume", s.id];
 // The row's project: the folder's name, or ~ for the home folder.
 export const project = (s) => (!s.cwd ? "?" : tilde(s.cwd) === "~" ? "~" : basename(s.cwd));
 export const agentName = (s) => (s.agent === "claude" ? "Claude Code" : "Codex");
-export const headline = (s) => s.title || s.prompt || s.id;
+export const headline = (s) => s.title || s.short || s.prompt || s.id;
 
 export function tabName(s) {
   const t = headline(s);
@@ -370,18 +398,67 @@ export function tabName(s) {
 }
 
 // place: "tab" or "right".
-export function resume(s, place) {
-  const args = { argv: command(s), folder: s.cwd, place };
-  if (place === "tab") args.name = tabName(s);
+export function resume(s, place, fork = false) {
+  const args = { argv: command(s, fork), folder: s.cwd, place };
+  if (place === "tab") args.name = fork ? `fork: ${tabName(s)}` : tabName(s);
   run("terminal.open", args);
 }
 
+const COPY = {
+  macos: 'printf %s "$1" | pbcopy',
+  windows: 'printf %s "$1" | clip',
+  linux: 'printf %s "$1" | (wl-copy 2>/dev/null || xclip -selection clipboard 2>/dev/null || xsel -b)',
+};
+const PASTE = {
+  macos: "pbpaste",
+  linux: "wl-paste -n 2>/dev/null || xclip -o -selection clipboard 2>/dev/null || xsel -b -o",
+};
+const setClipboard = (text) => exec("sh", ["-c", COPY[platform()] ?? COPY.linux, "sh", text])
+  .catch((e) => ({ code: 1, stderr: String(e) }));
+
 export async function copy(text) {
-  const p = platform();
-  const script = p === "macos" ? 'printf %s "$1" | pbcopy'
-    : p === "windows" ? 'printf %s "$1" | clip'
-    : 'printf %s "$1" | (wl-copy 2>/dev/null || xclip -selection clipboard 2>/dev/null || xsel -b)';
-  const r = await exec("sh", ["-c", script, "sh", text]).catch((e) => ({ code: 1, stderr: String(e) }));
+  const r = await setClipboard(text);
   if (r.code === 0) notify({ title: "Session id copied", body: text, level: "success", timeout: 2500 });
   else notify({ title: "Couldn't copy the session id", body: r.stderr || text, level: "error" });
+}
+
+// ---- Sending to an agent ---------------------------------------------------------------------
+
+const day = (ms) => new Date(ms).toISOString().slice(0, 10);
+
+// What goes into the agent's prompt: a header naming the session, then each message.
+export function quote(s, items) {
+  const who = (m) => (m.who === "you" ? "You" : agentName(s));
+  const body = items.map((m) => `${who(m)}: ${m.text.trim()}`).join("\n\n");
+  return `From a past session (${headline(s)}, ${day(s.mtime)}):\n\n${body}\n`;
+}
+
+// The last exchange: your last prompt and what the agent said after it.
+export function lastExchange(items) {
+  const i = items.map((m) => m.who).lastIndexOf("you");
+  return i < 0 ? items.slice(-1) : items.slice(i);
+}
+
+// Puts text into a terminal's prompt without pressing Enter. hc has no raw paste (`hc send`
+// wraps the text in <hc> tags and submits it; `hc keys` takes key names), so the text goes
+// on the clipboard and Herdr's `terminal.paste` pastes it into the focused terminal as one
+// bracketed paste, which agents take as a single paste however many lines it has. The
+// clipboard's previous text is put back a second later. `then` runs once the paste is
+// sent (the popup closes there).
+export async function pasteInto(terminal, text, then) {
+  const read = PASTE[platform()];
+  const old = read ? await exec("sh", ["-c", read]).catch(() => null) : null;
+  const r = await setClipboard(text);
+  if (r.code !== 0) {
+    notify({ title: "Couldn't use the clipboard", body: r.stderr || "", level: "error" });
+    return false;
+  }
+  run("pane.focus", { terminal });
+  run("terminal.paste");
+  then?.();
+  // A started exec outlives the popup that started it.
+  if (old?.code === 0 && old.stdout) {
+    exec("sh", ["-c", `sleep 1; ${COPY[platform()] ?? COPY.linux}`, "sh", old.stdout]).catch(() => {});
+  }
+  return true;
 }

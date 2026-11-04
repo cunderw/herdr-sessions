@@ -3,7 +3,7 @@
 // it if it's running now.
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { closeOverlay, nextCommand, notify, props, run, settings, theme } from "herdr";
+import { agents, closeOverlay, focused, nextCommand, notify, panes, props, run, settings, theme } from "herdr";
 import * as data from "./sessions.js";
 
 const ICON = (name) => `mods/sessions/${name}.svg`;
@@ -26,6 +26,15 @@ const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "
 // on_size_change reports sizes with the app's zoom applied; layout values are unzoomed.
 const unzoom = (px) => px / (Number(settings()?.zoom) || 1);
 
+// The terminal the popup was opened over: where "Send" pastes. Mod panes have none.
+function sendTarget() {
+  const terminal = focused()?.terminal;
+  if (!terminal) return null;
+  const a = agents().find((x) => x.address === terminal);
+  const pane = panes().find((p) => p.terminal === terminal);
+  return { terminal, name: a?.program?.name ?? pane?.program?.name ?? "terminal", agent: Boolean(a) };
+}
+
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1).trimEnd()}…` : s);
 
 export default class Sessions extends View {
@@ -38,6 +47,7 @@ export default class Sessions extends View {
     this.liveIds = {};
     this.previews = {};
     this.n = 0;
+    this.target = sendTarget();
     this.input = InputState.new({ placeholder: "Find a session…   /text searches what was said" });
     this.input.on("change", (_e, cx) => { this.query = this.input.value(); this.at = 0; this.update(cx); });
     this.input.on("submit", (e, cx) => this.submit(e?.secondary ? "copy" : e?.shift ? "right" : "tab", cx));
@@ -68,6 +78,8 @@ export default class Sessions extends View {
         else if (c === "prev") this.move(-1, cx);
         else if (c === "copy") this.submit("copy", cx);
         else if (c === "split") this.submit("right", cx);
+        else if (c === "fork") this.submit("fork", cx);
+        else if (c === "send") this.sendLast(cx);
         else continue;
         cx.notify();
       }
@@ -145,21 +157,43 @@ export default class Sessions extends View {
     closeOverlay(props()?.overlay);
   }
 
-  // how: "tab", "right" or "copy".
+  // how: "tab", "right", "fork" (a new tab branching from the session) or "copy".
   submit(how, cx) {
     const s = this.current();
-    if (!s) return;
+    if (!s || this.twice(how)) return;
     if (how === "copy") { this.close(); return data.copy(s.id); }
     const live = this.liveIds[s.id];
-    if (live) { this.close(); return run("agent.focus", { terminal: live.terminal }); }
+    // A fork starts a new session, so a running original doesn't stop it.
+    if (live && how !== "fork") { this.close(); return run("agent.focus", { terminal: live.terminal }); }
     cx.spawn(async () => {
       // Worktrees and scratch folders come and go; the agent can't resume outside its folder.
       if (!(await data.folderExists(s.cwd))) {
         return notify({ title: "That session's folder is gone", body: `${data.tilde(s.cwd ?? "?")} no longer exists. Recreate it, then run: ${data.command(s).join(" ")}`, level: "error" });
       }
       this.close();
-      data.resume(s, how);
+      data.resume(s, how === "fork" ? "tab" : how, how === "fork");
     });
+  }
+
+  // A key bound in keys.json may also reach on_key_down; act once.
+  twice(what) {
+    const now = Date.now(), dup = this.lastAct?.what === what && now - this.lastAct.at < 400;
+    this.lastAct = { what, at: now };
+    return dup;
+  }
+
+  // Pastes messages from the selected session into the agent that had focus when the popup
+  // opened, without sending them.
+  send(items, cx) {
+    const s = this.current();
+    if (!s || !items?.length || this.twice("send")) return;
+    if (!this.target) return notify({ title: "No terminal to send to", body: "Focus an agent's pane, then open sessions again.", level: "warning", timeout: 3000 });
+    cx.spawn(async () => { await data.pasteInto(this.target.terminal, data.quote(s, items), () => this.close()); });
+  }
+
+  sendLast(cx) {
+    const items = this.previews[this.current()?.path]?.items;
+    if (items?.length) this.send(data.lastExchange(items), cx);
   }
 
   key(e, cx) {
@@ -169,6 +203,8 @@ export default class Sessions extends View {
     else if (e.key === "up" || (m.control && e.key === "p")) this.move(-1, cx);
     else if (e.key === "pagedown") this.move(Math.min(this.fit(), (this.rows?.length ?? 1) - 1 - this.at) || 0, cx);
     else if (e.key === "pageup") this.move(-Math.min(this.fit(), this.at), cx);
+    else if (m.control && e.key === "o") this.submit("fork", cx);
+    else if (m.control && e.key === "s") this.sendLast(cx);
     else if (e.key === "tab") {
       // Tab flips between filtering the list and searching inside transcripts.
       const next = this.textMode() ? this.query.slice(1) : `/${this.query}`;
@@ -220,7 +256,7 @@ export default class Sessions extends View {
         .child(h_flex().gap(8).items_center()
           .child(this.agentIcon(s, 18))
           .child(div().flex_1().min_w(0).truncate().text_size(14).font_semibold().text_color(t.foreground).child(data.headline(s))))
-        .when(Boolean(s.title && s.prompt && s.title !== s.prompt), (el) =>
+        .when(Boolean(s.prompt && data.headline(s) !== s.prompt), (el) =>
           el.child(div().text_size(12).text_color(t.muted).child(clip(s.prompt, 160))))
         .child(meta("folder", data.tilde(s.cwd ?? "?")))
         .when(Boolean(s.branch), (el) => el.child(meta("git-branch", s.branch)))
@@ -229,14 +265,31 @@ export default class Sessions extends View {
         .when(Boolean(live), (el) => el.child(h_flex().gap(7).items_center()
           .child(div().size(8).rounded(4).flex_none().bg(t[live.status] ?? t.working))
           .child(div().truncate().text_size(12).text_color(t.foreground).child(`Running in ${live.where} · ${live.status}`)))))
+      .child(h_flex().gap(6).flex_none().items_center()
+        .child(this.button("act-resume", live ? "Show" : "Resume", t, (cx) => this.submit("tab", cx)))
+        .child(this.button("act-fork", "Fork", t, (cx) => this.submit("fork", cx)))
+        .child(this.button("act-send", this.target ? `Send to ${this.target.name}` : "Send", t, (cx) => this.sendLast(cx), !this.target || !items.length))
+        .child(this.button("act-copy", "Copy id", t, (cx) => this.submit("copy", cx))))
       .child(div().h(1).flex_none().bg(t.border))
       .when(!items.length, (el) => el.child(div().text_size(12).text_color(t.dim).child(p ? "Nothing to preview" : "Loading…")))
       .child(v_flex().id("exchanges").flex_1().min_h(0).gap(10).overflow_hidden()
         .on_size_change((size, cx) => { const h = unzoom(size.height), w = unzoom(size.width); if (h !== this.pvH || w !== this.pvW) { this.pvH = h; this.pvW = w; cx.notify(); } })
         .children(this.fitting(items).map((m, i) => v_flex().id(`msg-${i}`).gap(3).flex_none()
-          .child(div().text_size(11).font_semibold().text_color(m.who === "you" ? t.accent : t.muted)
-            .child(m.who === "you" ? "YOU" : data.agentName(s).toUpperCase()))
+          .child(h_flex().justify_between().items_center()
+            .child(div().text_size(11).font_semibold().text_color(m.who === "you" ? t.accent : t.muted)
+              .child(m.who === "you" ? "YOU" : data.agentName(s).toUpperCase()))
+            .when(Boolean(this.target), (el) => el.child(div().id(`send-${i}`).px(6).rounded(4).text_size(11).text_color(t.dim).cursor_pointer()
+              .hover((x) => x.text_color(t.accent).bg(t.hover))
+              .on_click((_e, cx) => this.send([m.src], cx))
+              .child("Send"))))
           .child(div().text_size(12.5).text_color(m.who === "you" ? t.foreground : t.muted).child(m.text)))));
+  }
+
+  button(id, label, t, act, disabled = false) {
+    return h_flex().id(id).h(24).px(9).flex_none().items_center().rounded(6).border_1().border_color(t.border)
+      .text_size(12).text_color(disabled ? t.dim : t.foreground)
+      .when(!disabled, (el) => el.cursor_pointer().hover((x) => x.bg(t.hover)).on_click((_e, cx) => act(cx)))
+      .child(label);
   }
 
   // The newest exchanges that fit the preview's measured size, oldest first. Line counts
@@ -254,7 +307,7 @@ export default class Sessions extends View {
         // The newest alone is too tall: show as much of it as fits.
         text = clip(text, Math.max(40, Math.floor((room - 27) / 18) * perLine));
       }
-      out.unshift({ who: m.who, text });
+      out.unshift({ who: m.who, text, src: m });
       room -= need;
     }
     return out;
@@ -271,7 +324,7 @@ export default class Sessions extends View {
       : text ? (this.query.slice(1).trim() ? "Nobody said that" : "Type to search what was said in every session")
       : this.all?.length ? "No sessions match" : "No Claude Code or Codex sessions found");
     const live = Object.keys(this.liveIds).length;
-    const footer = "Enter resumes in a tab (or shows it if live) · Shift+Enter in a split · ⌘/Ctrl+Enter copies the id · Tab searches transcripts";
+    const footer = "Enter resume · Shift+Enter split · Ctrl+O fork · Ctrl+S send last exchange · ⌘/Ctrl+Enter copy id · Tab search transcripts";
     // A popup sizes to its content, so the height is set here and stays put while typing.
     return v_flex().id("sessions").w_full().h(560).min_h(0).p(14).gap(10).bg(t.popover).text_size(13)
       .on_key_down((e, cx) => this.key(e, cx))
