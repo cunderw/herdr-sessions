@@ -2,6 +2,8 @@
 
 Find any past [Claude Code](https://claude.com/claude-code) or [Codex](https://github.com/openai/codex) session by what was said in it, and bring it back, inside the [Herdr](https://herdr.dev) desktop app.
 
+![Searching past sessions and sending an exchange to an agent](demo.gif)
+
 ![Agent sessions in Herdr](preview.png)
 
 - **One popup for every project** (`ctrl-b h`): your sessions newest first, each with its title or first prompt, its project and branch, the agent, how long ago, and how many turns you typed.
