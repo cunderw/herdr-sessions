@@ -68,22 +68,26 @@ A popup that finds any past Claude Code or Codex session, across every project, 
 - Herdr functions: `props`, `theme`, `settings`, `nextCommand`, `notify`, `closeOverlay`, `run`, `agents`, `terminals`, `exec`, `hc`, `home`, `appHome`, `readTextFile`, `window`; `fs/promises` (`readFile`, `writeFile`, `mkdir`) for the index.
 - Commands: `terminal.open {argv, folder, place: "tab", name}` and `{argv, folder, place: "right"}`, `agent.focus {terminal}`, `pane.focus {terminal}`, `terminal.paste`, `mod.open`.
 - The send target is `focused().terminal` read in `init`, while the popup is opening: the popup is an overlay, not a pane, so that is the terminal under it. Its name is the program's (`agents()`, else `panes()`).
-- Programs: `sh`, `find`, `stat`, `rg` or `grep`, `tail`, `test`, `hc`, `pbcopy` and `pbpaste` (`clip`; `wl-copy`/`wl-paste`, `xclip` or `xsel`).
+- Programs: `sh`, `find`, `stat`, `rg` or `grep`, `tail`, `test` and `hc`.
+- The clipboard is gpui-kit's own, `cx.read_from_clipboard()` and `cx.write_to_clipboard(text)`, the same on macOS, Linux and Windows: Copy id writes the id, and Send uses it as below.
 - `keys.json`'s `mod:sessions` section binds `sessions.next`, `sessions.prev`, `sessions.fork` and `sessions.send`; the popup also handles Ctrl+O and Ctrl+S itself, and ignores the same action twice within 400ms in case both see the key.
 - Icons: Lucide (ISC) `search`, `text-search`, `folder`, `git-branch`, `clock` and `hash`, drawn with `svg()` and tinted. The agent marks are Herdr's shipped `icons/claude.svg` and `icons/codex.svg`.
 
 ## Watch out
 
-- **Typing into an agent's prompt without submitting it.** `hc send` is the wrong tool: it wraps the text in `<hc from=…>` tags and presses Enter. `hc keys` takes key names only, and the hc API has no raw-input method short of a framed `terminal.attach` stream. What works is the clipboard and Herdr's own paste, which arrives as one bracketed paste:
+- **Typing into an agent's prompt without submitting it.** `hc send` is the wrong tool: it wraps the text in `<hc from=…>` tags and presses Enter. `hc keys` takes key names only, and the hc API has no raw-input method short of a framed `terminal.attach` stream. What works is the clipboard and Herdr's own paste, which arrives as one bracketed paste. Inside `cx.spawn((cx) => …)`:
 
   ```js
-  await exec("sh", ["-c", 'printf %s "$1" | pbcopy', "sh", text]);  // wl-copy / xclip / clip elsewhere
-  run("pane.focus", { terminal });   // terminal.paste takes no target
-  run("terminal.paste");             // pastes into the focused terminal
+  const before = cx.read_from_clipboard();       // undefined when it holds no text
+  cx.write_to_clipboard(text);
+  run("pane.focus", { terminal });               // terminal.paste takes no target
+  run("terminal.paste");                         // pastes into the focused terminal
+  await cx.sleep(400);
+  if (before !== undefined && cx.read_from_clipboard() === text) cx.write_to_clipboard(before);
   ```
 
-  From a shell it's `printf %s "$TEXT" | pbcopy; herdr-app do pane.focus --terminal t7; herdr-app do terminal.paste`. Claude Code shows `[Pasted text #1 +4 lines]` in its prompt and stays idle. Without the `pane.focus`, the text goes wherever the person is typing. Save the clipboard first (`pbpaste`) and put it back: the restore here is an `exec` of `sleep 1; pbcopy` started before the popup closes, because an `exec` already started outlives the copy that started it, while its tasks are cancelled.
-
+  Claude Code shows `[Pasted text #1 +5 lines]` in its prompt and stays idle. Without the `pane.focus`, the text goes wherever the person is typing. The restore is skipped when the person copied something else in the 400ms, and an image or file on the clipboard can't be put back. The popup closes only after the restore, because closing it cancels its tasks. From a shell, the same thing is `printf %s "$TEXT" | pbcopy; herdr-app do pane.focus --terminal t7; herdr-app do terminal.paste`.
+- Saving any file of a mod reloads every copy of it and runs `init` again in each, so a test hook driven from `init` must be one-shot (this build's deleted its trigger file before acting).
 - **Install by copying, not by symlinking the folder.** A symlinked mod folder loads its JavaScript but draws no icons. `install.sh` copies the files in.
 - **Always pass `rg --no-ignore --no-config`.** People keep `~/.claude` in git with an ignore-everything `.gitignore`, and rg reads ignore files from parent folders, so a plain `rg` silently finds no transcripts. `--no-config` keeps a `RIPGREP_CONFIG_PATH` from adding flags.
 - **`exec` output is capped at 8 MiB and 30 s, and `readTextFile` at 1 MiB.** Transcripts run to tens of MB and single lines (tool results) to several MB, so never print whole lines: use `-o` with bounded windows, and `tail -c` for the preview. Indexing in chunks keeps each call small.
@@ -108,7 +112,7 @@ A popup that finds any past Claude Code or Codex session, across every project, 
 - Enter on a finished session opens a tab named after it, in its folder, and the agent shows the earlier conversation. Shift+Enter does the same in a split.
 - That resumed session now shows `live`, and Enter on it switches to its tab without opening another.
 - Cmd/Ctrl+Enter puts the session id on the clipboard.
-- Opened over an agent, Ctrl+S puts `From a past session (…):` and the last exchange into that agent's prompt as one paste, unsent, and the clipboard holds what it held before a second later.
+- Opened over an agent, Ctrl+S puts `From a past session (…):` and the last exchange into that agent's prompt as one paste, unsent, and 400ms later the clipboard holds the text it held before.
 - Fork opens a tab named `fork: …` whose agent shows the earlier conversation under a new session id; the original transcript's size and time don't change.
 - A session whose first prompt is a long paragraph is headed by its first sentence.
 - A second open of the popup lists the sessions immediately from `data/sessions/index.json`.

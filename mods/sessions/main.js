@@ -161,7 +161,7 @@ export default class Sessions extends View {
   submit(how, cx) {
     const s = this.current();
     if (!s || this.twice(how)) return;
-    if (how === "copy") { this.close(); return data.copy(s.id); }
+    if (how === "copy") { data.copy(cx, s.id); return this.close(); }
     const live = this.liveIds[s.id];
     // A fork starts a new session, so a running original doesn't stop it.
     if (live && how !== "fork") { this.close(); return run("agent.focus", { terminal: live.terminal }); }
@@ -188,7 +188,9 @@ export default class Sessions extends View {
     const s = this.current();
     if (!s || !items?.length || this.twice("send")) return;
     if (!this.target) return notify({ title: "No terminal to send to", body: "Focus an agent's pane, then open sessions again.", level: "warning", timeout: 3000 });
-    cx.spawn(async () => { await data.pasteInto(this.target.terminal, data.quote(s, items), () => this.close()); });
+    const text = data.quote(s, items), terminal = this.target.terminal;
+    // The popup closes after the clipboard is put back: closing it cancels its tasks.
+    cx.spawn(async (cx) => { await data.pasteInto(cx, terminal, text); this.close(); });
   }
 
   sendLast(cx) {

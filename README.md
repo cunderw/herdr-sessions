@@ -34,9 +34,9 @@ Sessions are read from `~/.claude` and `~/.codex`, or from `$CLAUDE_CONFIG_DIR` 
 
 It reads your Claude Code transcripts (`projects/*/*.jsonl`, not sub-agents) and the small `sessions/<pid>.json` files Claude Code writes for running sessions, and your Codex transcripts (`sessions/**/rollout-*.jsonl`) and `session_index.jsonl`. It never changes them.
 
-It runs `find` and `stat` to list them, `rg` (falling back to `grep`) to index and search them, `tail` for the preview, `test -d` before resuming, `hc get` when Herdr doesn't report a terminal's process, and `pbcopy` (`clip`, `wl-copy`, `xclip` or `xsel` elsewhere) to copy an id. Resuming and forking start `claude` or `codex` in a new terminal.
+It runs `find` and `stat` to list them, `rg` (falling back to `grep`) to index and search them, `tail` for the preview, `test -d` before resuming, `hc get` when Herdr doesn't report a terminal's process, and nothing else. Resuming and forking start `claude` or `codex` in a new terminal.
 
-Sending to an agent uses your clipboard: it saves what's there with `pbpaste` (`wl-paste`, `xclip` or `xsel` elsewhere), puts the text on it, pastes it with Herdr's `terminal.paste`, and puts your text back a second later. A copied image or file is not put back.
+Copying an id writes it to your clipboard. Sending to an agent goes through the clipboard too: it puts the text there, pastes it with Herdr's `terminal.paste`, and 400ms later puts back the text you had copied, unless you've copied something else since. A copied image or file is not put back.
 
 It writes one file: an index of titles, folders and first prompts in `~/.config/herdr-app/data/sessions/index.json`, so the popup opens without rereading every transcript. Delete it any time; it is rebuilt.
 

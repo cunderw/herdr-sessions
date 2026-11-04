@@ -1,9 +1,8 @@
 // Past agent sessions on disk: where Claude Code and Codex keep them, a cached index,
 // full-text search, the preview, which ones are running now, and bringing one back.
-import { agents, appHome, exec, hc, home, notify, readTextFile, run, terminals, window } from "herdr";
+import { agents, appHome, exec, hc, home, notify, readTextFile, run, terminals } from "herdr";
 import * as fs from "fs/promises";
 
-const platform = () => window()?.platform ?? "macos";
 const expand = (p) => (p === "~" || p.startsWith("~/") ? home() + p.slice(1) : p);
 const dirname = (p) => p.replace(/\/[^/]*$/, "") || "/";
 export const basename = (p) => p.replace(/\/+$/, "").replace(/^.*\//, "") || p;
@@ -404,22 +403,10 @@ export function resume(s, place, fork = false) {
   run("terminal.open", args);
 }
 
-const COPY = {
-  macos: 'printf %s "$1" | pbcopy',
-  windows: 'printf %s "$1" | clip',
-  linux: 'printf %s "$1" | (wl-copy 2>/dev/null || xclip -selection clipboard 2>/dev/null || xsel -b)',
-};
-const PASTE = {
-  macos: "pbpaste",
-  linux: "wl-paste -n 2>/dev/null || xclip -o -selection clipboard 2>/dev/null || xsel -b -o",
-};
-const setClipboard = (text) => exec("sh", ["-c", COPY[platform()] ?? COPY.linux, "sh", text])
-  .catch((e) => ({ code: 1, stderr: String(e) }));
-
-export async function copy(text) {
-  const r = await setClipboard(text);
-  if (r.code === 0) notify({ title: "Session id copied", body: text, level: "success", timeout: 2500 });
-  else notify({ title: "Couldn't copy the session id", body: r.stderr || text, level: "error" });
+// gpui-kit's own clipboard: the same on macOS, Linux and Windows, no pbcopy or wl-copy.
+export function copy(cx, text) {
+  cx.write_to_clipboard(text);
+  notify({ title: "Session id copied", body: text, level: "success", timeout: 2500 });
 }
 
 // ---- Sending to an agent ---------------------------------------------------------------------
@@ -442,23 +429,15 @@ export function lastExchange(items) {
 // Puts text into a terminal's prompt without pressing Enter. hc has no raw paste (`hc send`
 // wraps the text in <hc> tags and submits it; `hc keys` takes key names), so the text goes
 // on the clipboard and Herdr's `terminal.paste` pastes it into the focused terminal as one
-// bracketed paste, which agents take as a single paste however many lines it has. The
-// clipboard's previous text is put back a second later. `then` runs once the paste is
-// sent (the popup closes there).
-export async function pasteInto(terminal, text, then) {
-  const read = PASTE[platform()];
-  const old = read ? await exec("sh", ["-c", read]).catch(() => null) : null;
-  const r = await setClipboard(text);
-  if (r.code !== 0) {
-    notify({ title: "Couldn't use the clipboard", body: r.stderr || "", level: "error" });
-    return false;
-  }
+// bracketed paste, which agents take as a single paste however many lines it has.
+// `terminal.paste` takes no target, hence the `pane.focus` first. The clipboard's text is
+// put back 400ms later, unless the person copied something else meanwhile. `cx` must be a
+// spawned task's: it is used after an await.
+export async function pasteInto(cx, terminal, text) {
+  const before = cx.read_from_clipboard();
+  cx.write_to_clipboard(text);
   run("pane.focus", { terminal });
   run("terminal.paste");
-  then?.();
-  // A started exec outlives the popup that started it.
-  if (old?.code === 0 && old.stdout) {
-    exec("sh", ["-c", `sleep 1; ${COPY[platform()] ?? COPY.linux}`, "sh", old.stdout]).catch(() => {});
-  }
-  return true;
+  await cx.sleep(400);
+  if (before !== undefined && cx.read_from_clipboard() === text) cx.write_to_clipboard(before);
 }
