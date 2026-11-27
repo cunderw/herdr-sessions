@@ -1,4 +1,4 @@
-// Past agent sessions on disk: where Claude Code and Codex keep them, a cached index,
+// Past agent sessions on disk: where Claude Code, Codex, omo, omp and pi keep them, a cached index,
 // full-text search, the preview, which ones are running now, and bringing one back.
 import { agents, appHome, exec, hc, home, notify, readTextFile, run, terminals } from "herdr";
 import * as fs from "fs/promises";
@@ -23,26 +23,39 @@ const CH = String.raw`([^"\\]|\\.)`;
 
 let located = null;
 
-// { claude, codex }: the two tools' home folders. `sessions.json` in Herdr's home
-// overrides them, else $CLAUDE_CONFIG_DIR / $CODEX_HOME, else ~/.claude and ~/.codex.
+// omo, omp and pi share one transcript format (pi's): `<agent dir>/sessions/<folder-slug>/
+// <time>_<id>.jsonl`, a `session` header with the folder, `message` records, and titles in
+// `session_info` (omo, pi) or `title` / `title_change` (omp).
+export const PI_LIKE = ["omo", "omp", "pi"];
+export const AGENTS = ["claude", "codex", ...PI_LIKE];
+
+// { claude, codex, omo, omp, pi }: each tool's home folder (for omo, omp and pi, the agent
+// folder that holds `sessions/`). `sessions.json` in Herdr's home overrides them, else
+// $CLAUDE_CONFIG_DIR / $CODEX_HOME / $PI_CODING_AGENT_DIR, else the usual places.
 export async function homes() {
   if (located) return located;
   const cfg = (await readJson(`${appHome()}/sessions.json`)) ?? {};
-  let env = ["", ""];
+  let env = ["", "", ""];
   try {
-    const r = await exec("sh", ["-c", 'printf "%s\\n%s" "$CLAUDE_CONFIG_DIR" "$CODEX_HOME"']);
+    const r = await exec("sh", ["-c", 'printf "%s\\n%s\\n%s" "$CLAUDE_CONFIG_DIR" "$CODEX_HOME" "$PI_CODING_AGENT_DIR"']);
     env = r.stdout.split("\n");
   } catch {}
+  const at = (name, fallback) => expand(cfg[name] ?? fallback).replace(/\/+$/, "");
   located = {
-    claude: expand(cfg.claude ?? (env[0] || "~/.claude")).replace(/\/+$/, ""),
-    codex: expand(cfg.codex ?? (env[1] || "~/.codex")).replace(/\/+$/, ""),
+    claude: at("claude", env[0] || "~/.claude"),
+    codex: at("codex", env[1] || "~/.codex"),
+    omo: at("omo", "~/.omo/agent"),
+    omp: at("omp", "~/.omp/agent"),
+    pi: at("pi", env[2] || "~/.pi/agent"),
   };
   return located;
 }
 
 // Every transcript with its mtime and size, from one `find` and `stat`. Claude Code keeps
 // `projects/<folder-slug>/<id>.jsonl` (sub-agents live a level deeper, in `<id>/subagents/`,
-// and are left out); Codex keeps `sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl`.
+// and are left out); Codex keeps `sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl`; omo, omp
+// and pi keep `sessions/<folder-slug>/<time>_<id>.jsonl` (omp's sub-agents live a level
+// deeper, in `<time>_<id>/`, and are left out).
 async function listFiles(h) {
   // GNU stat takes -c, BSD (macOS) stat takes -f.
   const script = `
@@ -50,12 +63,18 @@ async function listFiles(h) {
     [ -d "$1" ] && find "$1" -mindepth 2 -maxdepth 2 -name '*.jsonl' -type f -exec stat "$f" "$s" {} +
     echo --codex--
     [ -d "$2" ] && find "$2" -name 'rollout-*.jsonl' -type f -exec stat "$f" "$s" {} +
+    for a in omo omp pi; do
+      echo "--$a--"; d=$3; shift
+      [ -d "$d" ] && find "$d" -mindepth 2 -maxdepth 2 -name '*.jsonl' -type f -exec stat "$f" "$s" {} +
+    done
     true`;
-  const r = await exec("sh", ["-c", script, "sh", `${h.claude}/projects`, `${h.codex}/sessions`]);
+  const r = await exec("sh", ["-c", script, "sh", `${h.claude}/projects`, `${h.codex}/sessions`,
+    ...PI_LIKE.map((a) => `${h[a]}/sessions`)]);
   const files = [];
   let agent = "claude";
   for (const line of r.stdout.split("\n")) {
-    if (line === "--codex--") { agent = "codex"; continue; }
+    const marker = line.match(/^--([a-z]+)--$/);
+    if (marker && AGENTS.includes(marker[1])) { agent = marker[1]; continue; }
     const m = line.match(/^(\d+) (\d+) (.+)$/);
     if (m) files.push({ agent, mtime: Number(m[1]) * 1000, size: Number(m[2]), path: m[3] });
   }
@@ -201,7 +220,37 @@ async function indexCodex(files, h) {
     .map((s) => finish(s, names[s.id] ?? null, s.source && s.source !== "user"));
 }
 
+async function indexPi(files) {
+  const found = {};
+  for (const f of files) found[f.path] = { ...f, id: basename(f.path).match(UUID)?.[0] ?? basename(f.path).replace(/\.jsonl$/, ""), prompts: [] };
+  for (const part of chunks(files.map((f) => f.path), 60)) {
+    const [heads, said] = await Promise.all([
+      // The header and title records are short lines that start with their type.
+      grepFiles([String.raw`^\{"type":"(session|session_info|title|title_change)",.*`], part),
+      // Typed prompts; tool results have the role `toolResult` and don't match.
+      grepFiles([String.raw`"role":"user","content":\[\{"type":"text","text":"${CH}{0,240}`], part),
+    ]);
+    for (const [path, m] of heads) {
+      const s = found[path];
+      let j;
+      try { j = JSON.parse(m); } catch { continue; }
+      if (j.type === "session") {
+        if (j.cwd && !s.cwd) s.cwd = j.cwd;
+        if (j.id && UUID.test(j.id)) s.id = j.id;
+        if (j.title) s.title = j.title;
+      } else if (j.type === "session_info" && j.name) s.title = j.name; // the newest wins
+      else if (j.title) s.title = j.title;
+    }
+    for (const [path, m] of said) found[path].prompts.push(m.replace(/^.*?"text":"/, ""));
+  }
+  return Object.values(found).map((s) => finish(s, chosenTitle(s.title, s.cwd)));
+}
+
+// omp prefixes its titles with a Nerd Font glyph, which the UI font doesn't have.
+const GLYPHS = /[\uE000-\uF8FF]|[\u{F0000}-\u{10FFFF}]/gu;
+
 function finish(s, title, hidden = false) {
+  title = title ? title.replace(GLYPHS, "") : title;
   const kept = s.prompts.map((p) => cleanPrompt(unescape(p))).filter(Boolean);
   const first = kept.find((p) => !p.command) ?? kept[0];
   const prompt = first ? first.text.replace(/\s+/g, " ").trim() : "";
@@ -216,7 +265,7 @@ function finish(s, title, hidden = false) {
 
 // ---- The cached list ------------------------------------------------------------------
 
-const CACHE_VERSION = 2;
+const CACHE_VERSION = 3;
 const cachePath = () => `${appHome()}/data/sessions/index.json`;
 
 export async function cached() {
@@ -230,17 +279,18 @@ export async function load(prev) {
   const t0 = Date.now();
   const h = await homes();
   const files = await listFiles(h);
-  const key = `${h.claude}|${h.codex}`;
+  const key = AGENTS.map((a) => h[a]).join("|");
   const old = prev?.key === key ? prev.sessions : {};
-  const keep = {}, stale = { claude: [], codex: [] };
+  const keep = {}, stale = Object.fromEntries(AGENTS.map((a) => [a, []]));
   for (const f of files) {
     const o = old[f.path];
     if (o && o.mtime === f.mtime && o.size === f.size) keep[f.path] = o;
     else stale[f.agent].push(f);
   }
   const fresh = [...(await indexClaude(stale.claude)), ...(await indexCodex(stale.codex, h))];
+  for (const a of PI_LIKE) fresh.push(...(await indexPi(stale[a])));
   for (const s of fresh) keep[s.path] = s;
-  const read = stale.claude.length + stale.codex.length;
+  const read = AGENTS.reduce((n, a) => n + stale[a].length, 0);
   if (read || Object.keys(old).length !== Object.keys(keep).length) {
     await fs.mkdir(dirname(cachePath()), { recursive: true }).catch(() => {});
     await fs.writeFile(cachePath(), JSON.stringify({ version: CACHE_VERSION, key, sessions: keep })).catch(() => {});
@@ -325,6 +375,14 @@ export async function preview(s) {
         skipping = !p;
         if (p) add("you", p.text);
       } else if (j.type === "assistant" && !skipping) add("agent", said(m.content, ["text"]));
+    } else if (PI_LIKE.includes(s.agent)) {
+      const m = j.message;
+      if (j.type !== "message" || !m) continue;
+      if (m.role === "user") {
+        const c = cleanPrompt(typeof m.content === "string" ? m.content : said(m.content, ["text"]));
+        skipping = !c;
+        if (c) add("you", c.text);
+      } else if (m.role === "assistant" && !skipping) add("agent", said(m.content, ["text"]));
     } else if (j.type === "response_item" && j.payload?.type === "message") {
       const p = j.payload;
       if (p.role === "user") { const c = cleanPrompt(said(p.content, ["input_text"])); skipping = !c; if (c) add("you", c.text); }
@@ -345,15 +403,43 @@ export async function folderExists(path) {
 // ---- Running now --------------------------------------------------------------------------
 
 // The session id a command line resumes: `claude --resume <id>`, `claude -r <id>`,
-// `claude --session-id <id>`, `codex resume <id>`.
+// `claude --session-id <id>`, `codex resume <id>`, `omp --resume <id|file>`,
+// `omo --session <file>`, `pi --session <id|file>` (file names carry the id).
 export function resumedId(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = String(argv[i]);
-    const eq = a.match(/^--(resume|session-id)=(.+)$/);
+    const eq = a.match(/^--(resume|session-id|session)=(.+)$/);
     if (eq && UUID.test(eq[2])) return eq[2].match(UUID)[0];
-    if (["--resume", "-r", "--session-id", "resume"].includes(a) && UUID.test(argv[i + 1] ?? "")) return String(argv[i + 1]).match(UUID)[0];
+    if (["--resume", "-r", "--session-id", "--session", "resume"].includes(a) && UUID.test(argv[i + 1] ?? "")) return String(argv[i + 1]).match(UUID)[0];
   }
   return null;
+}
+
+// Which of the five tools an agent terminal runs, or null.
+export function harnessOf(a) {
+  if (a.app === "claude-code") return "claude";
+  for (const k of [a.program?.key, a.app]) if (AGENTS.includes(k)) return k;
+  return null;
+}
+
+// omo writes `sessions/<slug>/session-holders/<id>/<pid>.json` for each running session.
+async function omoHolders(h) {
+  const r = await exec("find", [`${h.omo}/sessions`, "-mindepth", "4", "-maxdepth", "4", "-path", "*/session-holders/*", "-name", "*.json"]).catch(() => null);
+  const byPid = {};
+  for (const p of r?.stdout.split("\n") ?? []) {
+    const m = p.match(/session-holders\/([^/]+)\/(\d+)\.json$/);
+    if (m) byPid[m[2]] = m[1];
+  }
+  return byPid;
+}
+
+// omp writes `terminal-sessions/<tty>`: the folder, then the session file it has open.
+async function ompSession(h, pid) {
+  const r = await exec("ps", ["-o", "tty=", "-p", String(pid)]).catch(() => null);
+  const tty = r?.stdout.trim();
+  if (!tty || tty.startsWith("?")) return null;
+  const text = await readTextFile(`${h.omp}/terminal-sessions/${tty}`).catch(() => null);
+  return text?.split("\n")[1]?.match(UUID)?.[0] ?? null;
 }
 
 // { id: { terminal, status, where } } for the sessions running in a Herdr terminal on this
@@ -364,7 +450,9 @@ export async function live() {
   const h = await homes();
   const byAddress = Object.fromEntries(terminals().map((t) => [t.address, t]));
   const out = {};
-  await Promise.all(agents().filter((a) => !a.address.includes("/")).map(async (a) => {
+  const local = agents().filter((a) => !a.address.includes("/"));
+  const holders = local.some((a) => harnessOf(a) === "omo") ? await omoHolders(h) : {};
+  await Promise.all(local.map(async (a) => {
     let fg = byAddress[a.address]?.foreground;
     if (!fg) {
       const r = await hc(["get", a.address, "--json"]).catch(() => null);
@@ -372,8 +460,13 @@ export async function live() {
     }
     if (!fg) return;
     let id = resumedId(fg.argv ?? []);
-    if (fg.pid && (a.app === "claude-code" || a.program?.key === "claude")) {
+    const tool = harnessOf(a);
+    if (fg.pid && tool === "claude") {
       id = (await readJson(`${h.claude}/sessions/${fg.pid}.json`))?.sessionId ?? id;
+    } else if (fg.pid && tool === "omo") {
+      id = holders[fg.pid] ?? id;
+    } else if (fg.pid && tool === "omp") {
+      id = (await ompSession(h, fg.pid)) ?? id;
     }
     if (id) out[id] = { terminal: a.address, status: a.status, where: `${a.space_name} / ${a.tab_name}` };
   }));
@@ -383,12 +476,22 @@ export async function live() {
 // ---- Bringing one back ----------------------------------------------------------------------
 
 // fork: a new session that starts from this one's history; the original is left as it was.
-export const command = (s, fork = false) => s.agent === "claude"
-  ? ["claude", "--resume", s.id, ...(fork ? ["--fork-session"] : [])]
-  : ["codex", fork ? "fork" : "resume", s.id];
+// null when the tool can't fork from its command line (omo, omp).
+export function command(s, fork = false) {
+  switch (s.agent) {
+    case "claude": return ["claude", "--resume", s.id, ...(fork ? ["--fork-session"] : [])];
+    case "codex": return ["codex", fork ? "fork" : "resume", s.id];
+    case "omo": return fork ? null : ["omo", "--session", s.path];
+    case "omp": return fork ? null : ["omp", "--resume", s.path];
+    case "pi": return ["pi", fork ? "--fork" : "--session", s.path];
+  }
+  return null;
+}
+export const canFork = (s) => command(s, true) !== null;
 // The row's project: the folder's name, or ~ for the home folder.
 export const project = (s) => (!s.cwd ? "?" : tilde(s.cwd) === "~" ? "~" : basename(s.cwd));
-export const agentName = (s) => (s.agent === "claude" ? "Claude Code" : "Codex");
+const NAMES = { claude: "Claude Code", codex: "Codex", omo: "OMO", omp: "OMP", pi: "pi" };
+export const agentName = (s) => NAMES[s.agent] ?? s.agent;
 export const headline = (s) => s.title || s.short || s.prompt || s.id;
 
 export function tabName(s) {
