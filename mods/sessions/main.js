@@ -1,13 +1,14 @@
-// Agent sessions for Herdr: a popup that finds any past Claude Code or Codex session by
+// Agent sessions for Herdr: a popup that finds any past Claude Code, Codex, omo, omp or pi session by
 // what was said in it, previews it, and brings it back in a new tab or a split, or shows
 // it if it's running now.
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { agents, closeOverlay, focused, nextCommand, notify, panes, props, run, settings, theme } from "herdr";
+import { agents, closeOverlay, focused, knownAgents, nextCommand, notify, panes, props, run, settings, theme } from "herdr";
 import * as data from "./sessions.js";
 
 const ICON = (name) => `mods/sessions/${name}.svg`;
-const AGENT_ICON = { claude: "icons/claude.svg", codex: "icons/codex.svg" };
+// Until the program table answers (and for tools it doesn't list): Herdr's shipped icons.
+const AGENT_ICON = { claude: "icons/claude.svg", codex: "icons/codex.svg", omp: "icons/omp.svg", pi: "icons/pi.svg" };
 const ROW = 50;
 const WINDOW = 9;
 
@@ -48,6 +49,13 @@ export default class Sessions extends View {
     this.previews = {};
     this.n = 0;
     this.target = sendTarget();
+    // Icons follow programs.json, so personal icons and tiles show here too.
+    this.programs = {};
+    cx.spawn(async (cx) => {
+      const list = await knownAgents().catch(() => []);
+      this.programs = Object.fromEntries(list.map((p) => [p.key, p]));
+      cx.notify();
+    });
     this.input = InputState.new({ placeholder: "Find a session…   /text searches what was said" });
     this.input.on("change", (_e, cx) => { this.query = this.input.value(); this.at = 0; this.update(cx); });
     this.input.on("submit", (e, cx) => this.submit(e?.secondary ? "copy" : e?.shift ? "right" : "tab", cx));
@@ -165,6 +173,9 @@ export default class Sessions extends View {
     const live = this.liveIds[s.id];
     // A fork starts a new session, so a running original doesn't stop it.
     if (live && how !== "fork") { this.close(); return run("agent.focus", { terminal: live.terminal }); }
+    if (how === "fork" && !data.canFork(s)) {
+      return notify({ title: `${data.agentName(s)} can't fork from the command line`, body: "Resume it and fork from inside the session instead.", level: "warning", timeout: 3000 });
+    }
     cx.spawn(async () => {
       // Worktrees and scratch folders come and go; the agent can't resume outside its folder.
       if (!(await data.folderExists(s.cwd))) {
@@ -218,7 +229,12 @@ export default class Sessions extends View {
   }
 
   agentIcon(s, size = 16) {
-    return image(AGENT_ICON[s.agent]).size(size).flex_none().rounded(4);
+    const p = this.programs[s.agent];
+    const icon = p?.icon ?? AGENT_ICON[s.agent] ?? "icons/agent.svg";
+    const glyph = p?.tint ? svg(icon).text_color(p.color ?? theme().foreground) : image(icon);
+    if (!p?.tile) return glyph.size(size).flex_none().rounded(4);
+    return div().size(size).flex_none().rounded(4).bg(p.tile).flex().items_center().justify_center()
+      .child(glyph.size(Math.round(size * 0.8)));
   }
 
   row(s, index, t) {
@@ -269,7 +285,7 @@ export default class Sessions extends View {
           .child(div().truncate().text_size(12).text_color(t.foreground).child(`Running in ${live.where} · ${live.status}`)))))
       .child(h_flex().gap(6).flex_none().items_center()
         .child(this.button("act-resume", live ? "Show" : "Resume", t, (cx) => this.submit("tab", cx)))
-        .child(this.button("act-fork", "Fork", t, (cx) => this.submit("fork", cx)))
+        .child(this.button("act-fork", "Fork", t, (cx) => this.submit("fork", cx), !data.canFork(s)))
         .child(this.button("act-send", this.target ? `Send to ${this.target.name}` : "Send", t, (cx) => this.sendLast(cx), !this.target || !items.length))
         .child(this.button("act-copy", "Copy id", t, (cx) => this.submit("copy", cx))))
       .child(div().h(1).flex_none().bg(t.border))
@@ -324,7 +340,7 @@ export default class Sessions extends View {
       : this.searching && !rows.length ? "Searching transcripts…"
       : rows.length ? null
       : text ? (this.query.slice(1).trim() ? "Nobody said that" : "Type to search what was said in every session")
-      : this.all?.length ? "No sessions match" : "No Claude Code or Codex sessions found");
+      : this.all?.length ? "No sessions match" : "No Claude Code, Codex, omo, omp or pi sessions found");
     const live = Object.keys(this.liveIds).length;
     const footer = "Enter resume · Shift+Enter split · Ctrl+O fork · Ctrl+S send last exchange · ⌘/Ctrl+Enter copy id · Tab search transcripts";
     // A popup sizes to its content, so the height is set here and stays put while typing.
